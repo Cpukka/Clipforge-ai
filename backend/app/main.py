@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import os
 from app.database import engine, Base
 from app.routers import auth, videos, clips, admin, users
 from app.config import settings
@@ -7,11 +9,17 @@ from app.config import settings
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
+# Create uploads directory if it doesn't exist
+os.makedirs("uploads", exist_ok=True)
+
 app = FastAPI(
     title="ClipForge AI API",
     description="AI-powered video repurposing platform",
     version="1.0.0"
 )
+
+# Mount static files for uploads - THIS IS CRITICAL FOR VIDEO PLAYBACK
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # CORS configuration
 app.add_middleware(

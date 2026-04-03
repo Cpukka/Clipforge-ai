@@ -4,6 +4,7 @@ from typing import List
 import uuid
 import os
 import logging
+import subprocess
 from app import models, schemas, utils
 from app.database import get_db
 from app.utils.auth import get_current_active_user
@@ -21,7 +22,7 @@ router = APIRouter()
 async def upload_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    title: str = Form(None),  # Changed to Form to handle form data properly
+    title: str = Form(None),
     description: str = Form(None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_active_user)
@@ -56,23 +57,32 @@ async def upload_video(
     s3_key = f"videos/{current_user.id}/{uuid.uuid4()}{file_extension}"
     logger.info(f"Generated S3 key: {s3_key}")
     
-    # For development without S3, save locally
+    # Save locally (bypass S3 for development)
     try:
-        # Try S3 first
-        s3_url = await upload_to_s3(content, s3_key, file.content_type)
-        logger.info(f"Uploaded to S3: {s3_url}")
-    except Exception as e:
-        logger.warning(f"S3 upload failed: {e}. Falling back to local storage.")
-        # Fallback to local storage
         import aiofiles
         os.makedirs("uploads", exist_ok=True)
-        local_path = f"uploads/{s3_key.split('/')[-1]}"
+        local_filename = f"{uuid.uuid4()}{file_extension}"
+        local_path = f"uploads/{local_filename}"
         async with aiofiles.open(local_path, 'wb') as f:
             await f.write(content)
-        s3_url = f"http://localhost:8000/uploads/{s3_key.split('/')[-1]}"
-        logger.info(f"Saved locally: {local_path}")
+        s3_url = f"http://localhost:8000/uploads/{local_filename}"
+        logger.info(f"✅ Video saved locally: {local_path}")
+    except Exception as e:
+        logger.error(f"Failed to save file: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save video file")
     
-    # Create video record
+    # Try to get video duration using ffmpeg (optional)
+    duration = None
+    try:
+        import ffmpeg
+        probe = ffmpeg.probe(local_path)
+        duration = float(probe['format']['duration'])
+        logger.info(f"Video duration: {duration} seconds")
+    except Exception as e:
+        duration = 60  # Default duration
+        logger.warning(f"Could not get video duration: {e}, using default: 60s")
+    
+    # Create video record - Set to COMPLETED immediately for instant playback
     try:
         db_video = models.Video(
             user_id=current_user.id,
@@ -80,26 +90,29 @@ async def upload_video(
             description=description,
             filename=file.filename,
             file_size=file_size,
+            duration=duration,
             s3_key=s3_key,
             s3_url=s3_url,
-            status="pending"
+            status="completed",  # Changed from "pending" to "completed" for instant playback
+            processing_progress=100  # Set to 100% complete
         )
         db.add(db_video)
         db.commit()
         db.refresh(db_video)
-        logger.info(f"Video record created: {db_video.id}")
+        logger.info(f"✅ Video record created: {db_video.id} (status: completed)")
     except Exception as e:
         logger.error(f"Database error: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to create video record")
     
-    # Trigger background processing
+    # Optional: Trigger background processing for AI features (won't affect playback)
+    # This runs in background and won't block the response
     try:
         background_tasks.add_task(process_video.delay, db_video.id)
         logger.info(f"Background task added for video {db_video.id}")
     except Exception as e:
         logger.warning(f"Failed to start background task: {e}")
-        # Still return success as video is uploaded
+        # Still return success as video is uploaded and playable
     
     return db_video
 
@@ -112,7 +125,7 @@ async def get_user_videos(
 ):
     videos = db.query(models.Video).filter(
         models.Video.user_id == current_user.id
-    ).offset(skip).limit(limit).all()
+    ).order_by(models.Video.created_at.desc()).offset(skip).limit(limit).all()
     return videos
 
 @router.get("/{video_id}", response_model=schemas.VideoResponse)
@@ -145,11 +158,16 @@ async def delete_video(
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
     
-    # Delete from storage
+    # Delete file from local storage
     try:
-        await utils.storage.delete_from_s3(video.s3_key)
+        if video.s3_url:
+            local_filename = video.s3_url.split("/")[-1]
+            local_path = f"uploads/{local_filename}"
+            if os.path.exists(local_path):
+                os.remove(local_path)
+                logger.info(f"Deleted file: {local_path}")
     except Exception as e:
-        logger.warning(f"Failed to delete from storage: {e}")
+        logger.warning(f"Failed to delete file: {e}")
     
     # Delete from database
     db.delete(video)
@@ -172,6 +190,90 @@ async def process_video_manually(
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
     
+    # Trigger AI processing for clip generation
     background_tasks.add_task(process_video.delay, video_id)
     
-    return {"message": "Video processing started"}
+    return {"message": "AI processing started for clip generation"}
+
+# NEW ENDPOINT: Generate a clip from video
+@router.post("/{video_id}/generate-clip")
+async def generate_simple_clip(
+    video_id: int,
+    request: dict,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_active_user)
+):
+    video = db.query(models.Video).filter(
+        models.Video.id == video_id,
+        models.Video.user_id == current_user.id
+    ).first()
+    
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    platform = request.get("platform", "tiktok")
+    duration = request.get("duration", 30)
+    
+    # Get the video file path
+    if video.s3_url and video.s3_url.startswith('http://localhost'):
+        filename = video.s3_url.split("/")[-1]
+        video_path = f"uploads/{filename}"
+    else:
+        raise HTTPException(status_code=400, detail="Video file not found locally")
+    
+    if not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    # Create clips directory if it doesn't exist
+    os.makedirs("uploads/clips", exist_ok=True)
+    
+    # Generate unique clip filename
+    clip_filename = f"clip_{uuid.uuid4()}.mp4"
+    clip_path = f"uploads/clips/{clip_filename}"
+    
+    try:
+        # Use ffmpeg to cut the first X seconds of the video
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-t', str(duration),
+            '-c', 'copy',
+            clip_path
+        ]
+        
+        logger.info(f"Running FFmpeg command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            logger.error(f"FFmpeg error: {result.stderr}")
+            raise HTTPException(status_code=500, detail=f"Failed to generate clip: {result.stderr}")
+        
+        logger.info(f"✅ Clip generated: {clip_path}")
+        
+        # Create clip record in database
+        clip = models.Clip(
+            user_id=current_user.id,
+            video_id=video_id,
+            title=f"{video.title} - {platform.upper()} Clip",
+            start_time=0,
+            end_time=duration,
+            s3_key=f"clips/{clip_filename}",
+            s3_url=f"http://localhost:8000/uploads/clips/{clip_filename}",
+            duration=duration,
+            platform=platform
+        )
+        db.add(clip)
+        db.commit()
+        db.refresh(clip)
+        
+        return {
+            "message": f"{platform} clip generated successfully", 
+            "clip_id": clip.id,
+            "clip_url": clip.s3_url
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Clip generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

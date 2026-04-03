@@ -1,93 +1,146 @@
 from celery import Celery
 from sqlalchemy.orm import Session
-import ffmpeg
-import whisper
-import numpy as np
 from app.database import SessionLocal
 from app import models
-from app.utils.storage import download_from_s3, upload_to_s3
-import tempfile
+from app.tasks.video_processor import VideoProcessor
 import os
+import tempfile
+import uuid
+import logging
 
-celery = Celery('tasks', broker='redis://redis:6379/0')
+logger = logging.getLogger(__name__)
 
-@celery.task
-def process_video(video_id: int):
+celery = Celery('tasks', broker='redis://localhost:6379/0')
+
+@celery.task(bind=True)
+def process_video_for_clips(self, video_id: int):
+    """Main task to process video and generate clips for social media"""
     db = SessionLocal()
+    
     try:
-        # Update video status
+        # Get video
         video = db.query(models.Video).filter(models.Video.id == video_id).first()
-        video.status = "processing"
-        video.processing_progress = 10
-        db.commit()
+        if not video:
+            logger.error(f"Video {video_id} not found")
+            return
         
-        # Download video from S3
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
-            video_path = tmp_file.name
-            download_from_s3(video.s3_key, video_path)
+        logger.info(f"Processing video {video_id}: {video.title}")
         
-        # Get video duration
-        probe = ffmpeg.probe(video_path)
-        video.duration = float(probe['format']['duration'])
-        video.processing_progress = 20
-        db.commit()
-        
-        # Extract audio for transcription
-        audio_path = video_path.replace('.mp4', '.wav')
-        ffmpeg.input(video_path).output(audio_path, acodec='pcm_s16le', ac=1, ar='16k').run(overwrite_output=True)
-        
-        # Transcribe with Whisper
-        model = whisper.load_model("base")
-        result = model.transcribe(audio_path)
-        
-        # Save transcription
-        transcription = models.Transcription(
+        # Create processing job
+        job = models.ProcessingJob(
             video_id=video_id,
-            text=result['text'],
-            segments=result['segments'],
-            language=result['language']
+            job_type="clip_generation",
+            status="processing",
+            celery_task_id=self.request.id
         )
-        db.add(transcription)
-        video.processing_progress = 40
+        db.add(job)
         db.commit()
         
-        # Detect scenes and key moments
-        scenes = detect_scenes(video_path)
-        video.processing_progress = 60
+        # Initialize processor
+        processor = VideoProcessor()
+        
+        # Download video to temp file
+        local_path = None
+        if video.s3_url and video.s3_url.startswith('http://localhost'):
+            # Local file
+            filename = video.s3_url.split("/")[-1]
+            local_path = f"uploads/{filename}"
+        else:
+            # Would download from S3 here
+            logger.warning("S3 download not implemented")
+            job.status = "failed"
+            job.error_message = "S3 download not implemented"
+            db.commit()
+            return
+        
+        if not os.path.exists(local_path):
+            logger.error(f"Video file not found: {local_path}")
+            job.status = "failed"
+            job.error_message = f"Video file not found: {local_path}"
+            db.commit()
+            return
+        
+        # Get video info
+        info = processor.get_video_info(local_path)
+        logger.info(f"Video info: {info}")
+        
+        # Transcribe audio
+        logger.info("Transcribing audio...")
+        transcription = processor.extract_transcription(local_path)
+        
+        # Save transcription to database
+        db_transcription = models.Transcription(
+            video_id=video_id,
+            text=transcription["text"],
+            segments=transcription["segments"],
+            language=transcription["language"]
+        )
+        db.add(db_transcription)
         db.commit()
         
-        # Generate clips for different platforms
-        generate_clips(video_id, video_path, scenes, db)
+        # Detect key moments
+        logger.info("Detecting key moments...")
+        key_moments = processor.detect_key_moments(local_path, transcription)
         
-        # Update video status
-        video.status = "completed"
-        video.processing_progress = 100
+        # Generate clips for each platform
+        platforms = ["tiktok", "instagram", "youtube"]
+        generated_clips = []
+        
+        for moment in key_moments[:3]:  # Generate top 3 moments
+            start = moment["start"]
+            end = min(moment["end"] + 5, info["duration"])  # Add 5 seconds buffer
+            
+            for platform in platforms:
+                # Generate unique filename
+                clip_filename = f"{uuid.uuid4()}.mp4"
+                clip_path = f"uploads/clips/{clip_filename}"
+                os.makedirs("uploads/clips", exist_ok=True)
+                
+                # Generate clip
+                success = processor.generate_clip(
+                    local_path, start, end, clip_path, platform
+                )
+                
+                if success:
+                    # Create clip record
+                    clip = models.Clip(
+                        user_id=video.user_id,
+                        video_id=video_id,
+                        title=f"{video.title} - {moment['text'][:50]}",
+                        start_time=start,
+                        end_time=end,
+                        s3_key=f"clips/{clip_filename}",
+                        s3_url=f"http://localhost:8000/uploads/clips/{clip_filename}",
+                        duration=end - start,
+                        platform=platform
+                    )
+                    db.add(clip)
+                    generated_clips.append(clip)
+                    logger.info(f"Generated {platform} clip: {clip_filename}")
+        
+        db.commit()
+
+        if len(generated_clips) == 0:
+            logger.warning(f"No clips generated for video {video_id}, falling back to no key moments or conversion failure")
+            job.status = "failed"
+            job.error_message = "No clips generated"
+        else:
+            # Update job status
+            job.status = "completed"
+            job.progress = 100
+
         db.commit()
         
-        # Cleanup temp files
-        os.unlink(video_path)
-        os.unlink(audio_path)
+        logger.info(f"✅ Generated {len(generated_clips)} clips for video {video_id}")
         
     except Exception as e:
-        video.status = "failed"
-        video.processing_progress = 0
+        logger.error(f"Error processing video {video_id}: {e}")
+        job.status = "failed"
+        job.error_message = str(e)
         db.commit()
         raise e
     finally:
         db.close()
 
-def detect_scenes(video_path):
-    """Detect scene changes in video"""
-    probe = ffmpeg.probe(video_path, v='error', select_streams='v:0', show_entries='frame=pkt_pts_time,scene_score')
-    scenes = []
-    
-    # Simple scene detection based on frame differences
-    # You can implement more sophisticated detection here
-    
-    return scenes
-
-def generate_clips(video_id, video_path, scenes, db):
-    """Generate short clips from detected scenes"""
-    # Implementation for clip generation
-    # This would create clips for different platforms (9:16 aspect ratio)
-    pass
+# Alias for backward compatibility
+process_video = process_video_for_clips
