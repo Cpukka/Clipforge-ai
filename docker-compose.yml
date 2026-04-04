@@ -1,103 +1,76 @@
 services:
-  # PostgreSQL Database
   postgres:
     image: postgres:15-alpine
     container_name: clipforge-postgres
     environment:
       POSTGRES_USER: clipforge
-      POSTGRES_PASSWORD: Ubo@1234
+      POSTGRES_PASSWORD: clipforge123
       POSTGRES_DB: clipforge
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U clipforge"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # Redis for Celery
   redis:
     image: redis:7-alpine
     container_name: clipforge-redis
     ports:
       - "6379:6379"
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # Backend API
   backend:
     build: ./backend
     container_name: clipforge-backend
-    volumes:
-      - ./backend:/app
-      - backend_uploads:/app/uploads
-    environment:
-      - DATABASE_URL=postgresql://clipforge:clipforge123@postgres:5432/clipforge
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-your-super-secret-jwt-key-change-in-production}
-      - ALGORITHM=HS256
-      - ACCESS_TOKEN_EXPIRE_MINUTES=30
-      - CORS_ORIGINS=http://localhost:3000,http://localhost:3001
-      - MAX_UPLOAD_SIZE=524288000
-      - ALLOWED_VIDEO_TYPES=video/mp4,video/quicktime,video/mpeg,video/webm
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     ports:
       - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://clipforge:clipforge123@postgres:5432/clipforge
+      - REDIS_URL=redis://redis:6379
+      - SECRET_KEY=your-super-secret-key-change-in-production
+    volumes:
+      - ./backend/uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
-    command: >
-      sh -c "alembic upgrade head &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
-  # Celery Worker
   celery:
     build: ./backend
     container_name: clipforge-celery
-    volumes:
-      - ./backend:/app
-      - backend_uploads:/app/uploads
     environment:
       - DATABASE_URL=postgresql://clipforge:clipforge123@postgres:5432/clipforge
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-your-super-secret-jwt-key-change-in-production}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - REDIS_URL=redis://redis:6379
+      - SECRET_KEY=your-super-secret-key-change-in-production
+    volumes:
+      - ./backend/uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
     command: celery -A app.tasks.video_tasks worker --loglevel=info --pool=solo
 
-  # Frontend
   frontend:
     build: ./frontend
     container_name: clipforge-frontend
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-      - /app/.next
-    environment:
-      - NEXTAUTH_URL=http://localhost:3000
-      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-9v9KCTp4dPBej9blbxkZYAEz5lh4GFtgUkVyNuD98TQ=}
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
     ports:
       - "3000:3000"
+    environment:
+      - NEXTAUTH_URL=http://localhost:3000
+      - NEXTAUTH_SECRET=9v9KCTp4dPBej9blbxkZYAEz5lh4GFtgUkVyNuD98TQ=
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
       - backend
-    restart: unless-stopped
 
 volumes:
   postgres_data:
-  backend_uploads:
